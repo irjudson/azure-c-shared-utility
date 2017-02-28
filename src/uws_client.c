@@ -23,6 +23,7 @@
 #include "azure_c_shared_utility/gb_rand.h"
 #include "azure_c_shared_utility/base64.h"
 #include "azure_c_shared_utility/optionhandler.h"
+#include "azure_c_shared_utility/shared_util_options.h"
 
 static const char* UWS_CLIENT_OPTIONS = "uWSCLientOptions";
 
@@ -40,7 +41,7 @@ Codes_SRS_UWS_CLIENT_01_141: [ masking is done whether or not the WebSocket Prot
 */
 
 /* Requirements satisfied by the way the APIs are designed:
-Tests_SRS_UWS_CLIENT_01_211: [One implication of this is that in absence of extensions, senders and receivers must not depend on the presence of specific frame boundaries.]
+Codes_SRS_UWS_CLIENT_01_211: [One implication of this is that in absence of extensions, senders and receivers must not depend on the presence of specific frame boundaries.]
 */
 
 typedef enum UWS_STATE_TAG
@@ -193,13 +194,17 @@ UWS_CLIENT_HANDLE uws_client_create(const char* hostname, unsigned int port, con
                                 }
                                 else
                                 {
+                                    SOCKETIO_CONFIG socketio_config;
+
                                     /* Codes_SRS_UWS_CLIENT_01_013: [ The create arguments for the tls IO (when `use_ssl` is 1) shall have: ]*/
                                     /* Codes_SRS_UWS_CLIENT_01_014: [ - `hostname` set to the `hostname` argument passed to `uws_client_create`. ]*/
                                     /* Codes_SRS_UWS_CLIENT_01_015: [ - `port` set to the `port` argument passed to `uws_client_create`. ]*/
-                                    tlsio_config.hostname = hostname;
-                                    tlsio_config.port = port;
-                                    tlsio_config.underlying_io_interface = NULL;
-                                    tlsio_config.underlying_io_parameters = NULL;
+                                    socketio_config.hostname = hostname;
+                                    socketio_config.port = port;
+                                    socketio_config.accepted_socket = NULL;
+
+                                    tlsio_config.underlying_io_interface = socketio_get_interface_description();
+                                    tlsio_config.underlying_io_parameters = &socketio_config;
 
                                     result->underlying_io = xio_create(tlsio_interface, &tlsio_config);
                                     if (result->underlying_io == NULL)
@@ -240,7 +245,7 @@ UWS_CLIENT_HANDLE uws_client_create(const char* hostname, unsigned int port, con
 
                             if (result->underlying_io == NULL)
                             {
-                                /* Tests_SRS_UWS_CLIENT_01_016: [ If `xio_create` fails, then `uws_client_create` shall fail and return NULL. ]*/
+                                /* Codes_SRS_UWS_CLIENT_01_016: [ If `xio_create` fails, then `uws_client_create` shall fail and return NULL. ]*/
                                 singlylinkedlist_destroy(result->pending_sends);
                                 free(result->resource_name);
                                 free(result->hostname);
@@ -251,6 +256,161 @@ UWS_CLIENT_HANDLE uws_client_create(const char* hostname, unsigned int port, con
                             {
                                 result->uws_state = UWS_STATE_CLOSED;
                                 /* Codes_SRS_UWS_CLIENT_01_403: [ The argument `port` shall be copied for later use. ]*/
+                                result->port = port;
+
+                                result->on_ws_open_complete = NULL;
+                                result->on_ws_open_complete_context = NULL;
+                                result->on_ws_frame_received = NULL;
+                                result->on_ws_frame_received_context = NULL;
+                                result->on_ws_error = NULL;
+                                result->on_ws_error_context = NULL;
+                                result->on_ws_close_complete = NULL;
+                                result->on_ws_close_complete_context = NULL;
+                                result->received_bytes = NULL;
+                                result->received_bytes_count = 0;
+
+                                result->protocol_count = protocol_count;
+
+                                /* Codes_SRS_UWS_CLIENT_01_410: [ The `protocols` argument shall be allowed to be NULL, in which case no protocol is to be specified by the client in the upgrade request. ]*/
+                                if (protocols != NULL)
+                                {
+                                    result->protocols = (WS_INSTANCE_PROTOCOL*)malloc(sizeof(WS_INSTANCE_PROTOCOL) * protocol_count);
+                                    if (result->protocols == NULL)
+                                    {
+                                        /* Codes_SRS_UWS_CLIENT_01_414: [ If allocating memory for the copied protocol information fails then `uws_client_create` shall fail and return NULL. ]*/
+                                        LogError("Cannot allocate memory for the protocols array.");
+                                        xio_destroy(result->underlying_io);
+                                        singlylinkedlist_destroy(result->pending_sends);
+                                        free(result->resource_name);
+                                        free(result->hostname);
+                                        free(result);
+                                        result = NULL;
+                                    }
+                                    else
+                                    {
+                                        /* Codes_SRS_UWS_CLIENT_01_413: [ The protocol information indicated by `protocols` and `protocol_count` shall be copied for later use (for constructing the upgrade request). ]*/
+                                        for (i = 0; i < protocol_count; i++)
+                                        {
+                                            if (mallocAndStrcpy_s(&result->protocols[i].protocol, protocols[i].protocol) != 0)
+                                            {
+                                                /* Codes_SRS_UWS_CLIENT_01_414: [ If allocating memory for the copied protocol information fails then `uws_client_create` shall fail and return NULL. ]*/
+                                                LogError("Cannot allocate memory for the protocol index %u.", (unsigned int)i);
+                                                break;
+                                            }
+                                        }
+
+                                        if (i < protocol_count)
+                                        {
+                                            size_t j;
+
+                                            for (j = 0; j < i; j++)
+                                            {
+                                                free(result->protocols[j].protocol);
+                                            }
+
+                                            free(result->protocols);
+                                            xio_destroy(result->underlying_io);
+                                            singlylinkedlist_destroy(result->pending_sends);
+                                            free(result->resource_name);
+                                            free(result->hostname);
+                                            free(result);
+                                            result = NULL;
+                                        }
+                                        else
+                                        {
+                                            result->protocol_count = protocol_count;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+UWS_CLIENT_HANDLE uws_client_create_with_io(const IO_INTERFACE_DESCRIPTION* io_interface, void* io_create_parameters, const char* hostname, unsigned int port, const char* resource_name, const WS_PROTOCOL* protocols, size_t protocol_count)
+{
+    UWS_CLIENT_HANDLE result;
+
+    if ((hostname == NULL) ||
+        (io_interface == NULL) ||
+        (resource_name == NULL) ||
+        ((protocols == NULL) && (protocol_count > 0)))
+    {
+        LogError("Invalid arguments: io_interface = %p, resource_name = %p, protocols = %p, protocol_count = %zu", io_interface, resource_name, protocols, protocol_count);
+        result = NULL;
+    }
+    else
+    {
+        size_t i;
+        for (i = 0; i < protocol_count; i++)
+        {
+            if (protocols[i].protocol == NULL)
+            {
+                break;
+            }
+        }
+
+        if (i < protocol_count)
+        {
+            LogError("Protocol index %zu has NULL name", i);
+            result = NULL;
+        }
+        else
+        {
+            result = (UWS_CLIENT_HANDLE)malloc(sizeof(UWS_CLIENT_INSTANCE));
+            if (result == NULL)
+            {
+                LogError("Could not allocate uWS instance");
+            }
+            else
+            {
+                if (mallocAndStrcpy_s(&result->hostname, hostname) != 0)
+                {
+                    LogError("Could not copy hostname.");
+                    free(result);
+                    result = NULL;
+                }
+                else
+                {
+                    if (mallocAndStrcpy_s(&result->resource_name, resource_name) != 0)
+                    {
+                        LogError("Could not copy resource.");
+                        free(result->hostname);
+                        free(result);
+                        result = NULL;
+                    }
+                    else
+                    {
+                        result->pending_sends = singlylinkedlist_create();
+                        if (result->pending_sends == NULL)
+                        {
+                            LogError("Could not allocate pending send frames list");
+                            free(result->resource_name);
+                            free(result->hostname);
+                            free(result);
+                            result = NULL;
+                        }
+                        else
+                        {
+                            result->underlying_io = xio_create(io_interface, io_create_parameters);
+                            if (result->underlying_io == NULL)
+                            {
+                                LogError("Cannot create underlying IO.");
+                                singlylinkedlist_destroy(result->pending_sends);
+                                free(result->resource_name);
+                                free(result->hostname);
+                                free(result);
+                                result = NULL;
+                            }
+                            else
+                            {
+                                result->uws_state = UWS_STATE_CLOSED;
                                 result->port = port;
 
                                 result->on_ws_open_complete = NULL;
@@ -1314,6 +1474,7 @@ static int complete_send_frame(WS_PENDING_SEND* ws_pending_send, LIST_ITEM_HANDL
     /* Codes_SRS_UWS_CLIENT_01_432: [ The indicated sent frame shall be removed from the list by calling `singlylinkedlist_remove`. ]*/
     if (singlylinkedlist_remove(uws_client->pending_sends, pending_send_frame_item) != 0)
     {
+        LogError("Failed removing item from list");
         result = __FAILURE__;
     }
     else
@@ -1505,8 +1666,6 @@ int uws_client_send_frame_async(UWS_CLIENT_HANDLE uws_client, unsigned char fram
 {
     int result;
 
-    (void)frame_type;
-
     if (uws_client == NULL)
     {
         /* Codes_SRS_UWS_CLIENT_01_044: [ If any the arguments `uws_client` is NULL, `uws_client_send_frame_async` shall fail and return a non-zero value. ]*/
@@ -1549,6 +1708,7 @@ int uws_client_send_frame_async(UWS_CLIENT_HANDLE uws_client, unsigned char fram
             if (non_control_frame_buffer == NULL)
             {
                 /* Codes_SRS_UWS_CLIENT_01_426: [ If `uws_frame_encoder_encode` fails, `uws_client_send_frame_async` shall fail and return a non-zero value. ]*/
+                LogError("Failed encoding WebSocket frame");
                 free(ws_pending_send);
                 result = __FAILURE__;
             }
